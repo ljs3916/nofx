@@ -1,0 +1,15 @@
+name: rebuild-huggingface
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+
+jobs:
+  restart-space:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Hugging Face rebuild
+        run: |
+          curl -X POST https://huggingface.co/api/spaces/lcy1313/nofx1313/restart
