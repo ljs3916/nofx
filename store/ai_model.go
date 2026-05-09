@@ -54,6 +54,24 @@ func (s *AIModelStore) initDefaultData() error {
 	return nil
 }
 
+// FindOrphanClaw402 finds a claw402 model whose user_id no longer exists in the users table.
+// Used to recover wallets after account reset.
+func (s *AIModelStore) FindOrphanClaw402() (*AIModel, error) {
+	var model AIModel
+	err := s.db.Where("provider = ? AND api_key != '' AND user_id NOT IN (SELECT id FROM users)", "claw402").
+		First(&model).Error
+	if err != nil {
+		return nil, err
+	}
+	return &model, nil
+}
+
+// AdoptModel re-assigns an existing model to a new user.
+func (s *AIModelStore) AdoptModel(modelID, newUserID string) error {
+	return s.db.Model(&AIModel{}).Where("id = ?", modelID).
+		Update("user_id", newUserID).Error
+}
+
 // List retrieves user's AI model list
 func (s *AIModelStore) List(userID string) ([]*AIModel, error) {
 	var models []*AIModel
@@ -94,7 +112,7 @@ func (s *AIModelStore) Get(userID, modelID string) (*AIModel, error) {
 	return nil, gorm.ErrRecordNotFound
 }
 
-// GetByID retrieves an AI model by ID only (for debate engine)
+// GetByID retrieves an AI model by ID only
 func (s *AIModelStore) GetByID(modelID string) (*AIModel, error) {
 	if modelID == "" {
 		return nil, fmt.Errorf("model ID cannot be empty")
@@ -113,7 +131,7 @@ func (s *AIModelStore) GetDefault(userID string) (*AIModel, error) {
 	if userID == "" {
 		userID = "default"
 	}
-	model, err := s.firstEnabled(userID)
+	model, err := s.firstEnabledUsable(userID)
 	if err == nil {
 		return model, nil
 	}
@@ -121,14 +139,27 @@ func (s *AIModelStore) GetDefault(userID string) (*AIModel, error) {
 		return nil, err
 	}
 	if userID != "default" {
-		return s.firstEnabled("default")
+		return s.firstEnabledUsable("default")
 	}
 	return nil, fmt.Errorf("please configure an available AI model in the system first")
 }
 
-func (s *AIModelStore) firstEnabled(userID string) (*AIModel, error) {
+func (s *AIModelStore) firstEnabledUsable(userID string) (*AIModel, error) {
 	var model AIModel
-	err := s.db.Where("user_id = ? AND enabled = ?", userID, true).
+	err := s.db.Where("user_id = ? AND enabled = ? AND api_key != ''", userID, true).
+		Order("updated_at DESC, id ASC").
+		First(&model).Error
+	if err != nil {
+		return nil, err
+	}
+	return &model, nil
+}
+
+// GetAnyEnabled returns the first enabled AI model across all users.
+// Used by single-user features (e.g. Telegram bot) that need any working LLM client.
+func (s *AIModelStore) GetAnyEnabled() (*AIModel, error) {
+	var model AIModel
+	err := s.db.Where("enabled = ? AND api_key != ''", true).
 		Order("updated_at DESC, id ASC").
 		First(&model).Error
 	if err != nil {
@@ -222,6 +253,43 @@ func (s *AIModelStore) Update(userID, id string, enabled bool, apiKey, customAPI
 }
 
 // Create creates an AI model
+// ResolveClaw402WalletKey returns the claw402 wallet private key for a user.
+// If preferredModelID is non-empty and points to a claw402 model, its key is returned first.
+// Otherwise the first enabled claw402 model in the user's model list is used.
+// Returns ("", nil) when no claw402 model is configured — callers should treat this as
+// "no paid data routing" rather than an error.
+func (s *AIModelStore) ResolveClaw402WalletKey(userID, preferredModelID string) (string, error) {
+	if preferredModelID != "" {
+		model, err := s.Get(userID, preferredModelID)
+		if err != nil {
+			return "", fmt.Errorf("failed to load selected AI model")
+		}
+		if model.Provider == "claw402" {
+			walletKey := string(model.APIKey)
+			if walletKey == "" {
+				return "", fmt.Errorf("selected claw402 model is missing wallet private key")
+			}
+			return walletKey, nil
+		}
+	}
+
+	models, err := s.List(userID)
+	if err != nil {
+		return "", fmt.Errorf("failed to load AI models")
+	}
+
+	for _, model := range models {
+		if model == nil || model.Provider != "claw402" {
+			continue
+		}
+		if walletKey := string(model.APIKey); walletKey != "" {
+			return walletKey, nil
+		}
+	}
+
+	return "", nil
+}
+
 func (s *AIModelStore) Create(userID, id, name, provider string, enabled bool, apiKey, customAPIURL string) error {
 	model := &AIModel{
 		ID:           id,
@@ -234,4 +302,17 @@ func (s *AIModelStore) Create(userID, id, name, provider string, enabled bool, a
 	}
 	// Use FirstOrCreate to ignore if already exists
 	return s.db.Where("id = ?", id).FirstOrCreate(model).Error
+}
+
+// Delete removes a user-owned AI model configuration.
+func (s *AIModelStore) Delete(userID, id string) error {
+	result := s.db.Where("user_id = ? AND id = ?", userID, id).Delete(&AIModel{})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("ai model not found: id=%s, userID=%s", id, userID)
+	}
+	logger.Infof("🗑️ Deleted AI model: id=%s, userID=%s", id, userID)
+	return nil
 }

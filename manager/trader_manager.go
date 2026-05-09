@@ -3,8 +3,6 @@ package manager
 import (
 	"context"
 	"fmt"
-	"nofx/debate"
-	"nofx/kernel"
 	"nofx/logger"
 	"nofx/store"
 	"nofx/trader"
@@ -13,25 +11,11 @@ import (
 	"time"
 )
 
-// TraderExecutorAdapter wraps AutoTrader to implement debate.TraderExecutor
-type TraderExecutorAdapter struct {
-	autoTrader *trader.AutoTrader
-}
-
-// ExecuteDecision executes a trading decision
-func (a *TraderExecutorAdapter) ExecuteDecision(d *kernel.Decision) error {
-	return a.autoTrader.ExecuteDecision(d)
-}
-
-// GetBalance returns account balance
-func (a *TraderExecutorAdapter) GetBalance() (map[string]interface{}, error) {
-	info, err := a.autoTrader.GetAccountInfo()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get account info: %w", err)
+func traderLogTag(traderID, traderName string) string {
+	if traderName != "" {
+		return fmt.Sprintf("[trader_id=%s trader_name=%s]", traderID, traderName)
 	}
-	// Log the balance for debugging
-	logger.Infof("[Debate] GetBalance for trader, result: %+v", info)
-	return info, nil
+	return fmt.Sprintf("[trader_id=%s]", traderID)
 }
 
 // CompetitionCache competition data cache
@@ -111,9 +95,9 @@ func (tm *TraderManager) StartAll() {
 	logger.Info("🚀 Starting all traders...")
 	for id, t := range tm.traders {
 		go func(traderID string, at *trader.AutoTrader) {
-			logger.Infof("▶️  Starting %s...", at.GetName())
+			logger.Infof("%s ▶️ Starting trader runtime", traderLogTag(traderID, at.GetName()))
 			if err := at.Run(); err != nil {
-				logger.Infof("❌ %s runtime error: %v", at.GetName(), err)
+				logger.Warnf("%s runtime error: %v", traderLogTag(traderID, at.GetName()), err)
 			}
 		}(id, t)
 	}
@@ -159,9 +143,9 @@ func (tm *TraderManager) AutoStartRunningTraders(st *store.Store) {
 	for id, t := range tm.traders {
 		if runningTraderIDs[id] {
 			go func(traderID string, at *trader.AutoTrader) {
-				logger.Infof("▶️  Auto-restoring %s...", at.GetName())
+				logger.Infof("%s ▶️ Auto-restoring trader runtime", traderLogTag(traderID, at.GetName()))
 				if err := at.Run(); err != nil {
-					logger.Infof("❌ %s runtime error: %v", at.GetName(), err)
+					logger.Warnf("%s runtime error: %v", traderLogTag(traderID, at.GetName()), err)
 				}
 			}(id, t)
 			startedCount++
@@ -510,7 +494,7 @@ func (tm *TraderManager) LoadUserTradersFromStore(st *store.Store, userID string
 		logger.Infof("📦 Loading trader %s (AI Model: %s, Exchange: %s/%s, Strategy ID: %s)", traderCfg.Name, aiModelCfg.Provider, exchangeCfg.ExchangeType, exchangeCfg.AccountName, traderCfg.StrategyID)
 		err = tm.addTraderFromStore(traderCfg, aiModelCfg, exchangeCfg, st)
 		if err != nil {
-			logger.Infof("❌ Failed to load trader %s: %v", traderCfg.Name, err)
+			logger.Warnf("%s failed to load trader: %v", traderLogTag(traderCfg.ID, traderCfg.Name), err)
 			// Save error for later retrieval
 			tm.loadErrors[traderCfg.ID] = err
 		} else {
@@ -615,7 +599,7 @@ func (tm *TraderManager) LoadTradersFromStore(st *store.Store) error {
 		// Add to TraderManager (ai500APIURL/oiTopAPIURL already obtained from strategy config)
 		err = tm.addTraderFromStore(traderCfg, aiModelCfg, exchangeCfg, st)
 		if err != nil {
-			logger.Infof("❌ Failed to add trader %s: %v", traderCfg.Name, err)
+			logger.Warnf("%s failed to add trader: %v", traderLogTag(traderCfg.ID, traderCfg.Name), err)
 			continue
 		}
 	}
@@ -726,6 +710,8 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 		traderConfig.CustomAPIKey = string(aiModelCfg.APIKey)
 	}
 
+	traderConfig.Claw402WalletKey = resolveTraderDataWalletKey(st, traderCfg.UserID, aiModelCfg)
+
 	// Create trader instance
 	at, err := trader.NewAutoTrader(traderConfig, st, traderCfg.UserID)
 	if err != nil {
@@ -748,28 +734,42 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 
 	// Auto-start if trader was running before shutdown
 	if traderCfg.IsRunning {
-		logger.Infof("🔄 Auto-starting trader '%s' (was running before shutdown)...", traderCfg.Name)
+		logger.Infof("%s 🔄 Auto-starting trader (was running before shutdown)...", traderLogTag(traderCfg.ID, traderCfg.Name))
 		go func(trader *trader.AutoTrader, traderName, traderID, userID string) {
 			if err := trader.Run(); err != nil {
-				logger.Warnf("⚠️ Trader '%s' stopped with error: %v", traderName, err)
+				logger.Warnf("%s trader stopped with error: %v", traderLogTag(traderID, traderName), err)
 				// Update database to reflect stopped state
 				if st != nil {
 					_ = st.Trader().UpdateStatus(userID, traderID, false)
 				}
 			}
 		}(at, traderCfg.Name, traderCfg.ID, traderCfg.UserID)
-		logger.Infof("✅ Trader '%s' auto-started successfully", traderCfg.Name)
+		logger.Infof("%s ✅ Trader auto-started successfully", traderLogTag(traderCfg.ID, traderCfg.Name))
 	}
 
 	return nil
 }
 
-// GetTraderExecutor returns a TraderExecutor for the given trader ID
-// This is used by the debate module to execute consensus trades
-func (tm *TraderManager) GetTraderExecutor(traderID string) (debate.TraderExecutor, error) {
-	at, err := tm.GetTrader(traderID)
-	if err != nil {
-		return nil, err
+func resolveTraderDataWalletKey(st *store.Store, userID string, selectedModel *store.AIModel) string {
+	// Fast path: selected model is itself a claw402 model.
+	if selectedModel != nil && selectedModel.Provider == "claw402" {
+		if walletKey := string(selectedModel.APIKey); walletKey != "" {
+			return walletKey
+		}
 	}
-	return &TraderExecutorAdapter{autoTrader: at}, nil
+
+	if st == nil {
+		return ""
+	}
+
+	// Fallback: find any configured claw402 model for this user so that paid
+	// NofxAI data sources work even when a non-claw402 model (e.g. deepseek) is
+	// selected as the AI brain.
+	preferredID := ""
+	walletKey, err := st.AIModel().ResolveClaw402WalletKey(userID, preferredID)
+	if err != nil {
+		logger.Warnf("⚠️ Failed to load claw402 wallet for trader data routing: %v", err)
+		return ""
+	}
+	return walletKey
 }
